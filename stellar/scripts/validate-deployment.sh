@@ -146,6 +146,98 @@ else
     info "No stellar.expert URLs found in output"
 fi
 
+# RPC validation - verify each contract exists on the expected network
+header "RPC Contract Verification"
+
+# Determine RPC URL based on network
+case "$NETWORK" in
+    futurenet)
+        RPC_URL="${RPC_URL:-https://rpc-futurenet.stellar.org}"
+        NETWORK_PASSPHRASE="Test SDF Future Network ; October 2022"
+        ;;
+    testnet)
+        RPC_URL="${RPC_URL:-https://soroban-testnet.stellar.org}"
+        NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+        ;;
+    mainnet)
+        RPC_URL="${RPC_URL:-https://soroban-rpc.stellar.org}"
+        NETWORK_PASSPHRASE="Public Global Stellar Network ; September 2015"
+        ;;
+    *)
+        RPC_URL="${RPC_URL:-}"
+        NETWORK_PASSPHRASE=""
+        ;;
+esac
+
+if [ -z "$RPC_URL" ]; then
+    fail "No RPC_URL configured for network: $NETWORK"
+    info "Set RPC_URL environment variable or use a known network (futurenet, testnet, mainnet)"
+    VALIDATION_FAILED=1
+else
+    info "Using RPC: $RPC_URL"
+    
+    # Check if stellar or soroban CLI is available
+    if command -v stellar &>/dev/null; then
+        STELLAR_CLI="stellar"
+    elif command -v soroban &>/dev/null; then
+        STELLAR_CLI="soroban"
+    else
+        fail "Neither 'stellar' nor 'soroban' CLI found in PATH"
+        info "Install stellar-cli to enable RPC verification"
+        VALIDATION_FAILED=1
+        STELLAR_CLI=""
+    fi
+    
+    if [ -n "$STELLAR_CLI" ]; then
+        # Configure network for CLI
+        $STELLAR_CLI network add \
+            --global \
+            --rpc-url "$RPC_URL" \
+            --network-passphrase "$NETWORK_PASSPHRASE" \
+            "validation-$NETWORK" 2>/dev/null || true
+        
+        # Verify each contract exists on the network
+        for contract in "${REQUIRED_CONTRACTS[@]}"; do
+            CONTRACT_ID="${CONTRACT_IDS[$contract]:-}"
+            
+            if [ -z "$CONTRACT_ID" ]; then
+                continue  # Already reported as missing
+            fi
+            
+            info "Verifying $contract on network..."
+            
+            # Use `stellar contract info` to check if contract exists
+            # This queries the RPC and fails if contract doesn't exist
+            CONTRACT_INFO=$($STELLAR_CLI contract info wasm-hash \
+                --id "$CONTRACT_ID" \
+                --network "validation-$NETWORK" \
+                2>&1)
+            
+            EXIT_CODE=$?
+            
+            if [ $EXIT_CODE -eq 0 ] && [ -n "$CONTRACT_INFO" ]; then
+                # Contract exists and returned info
+                ok "$contract: Verified on $NETWORK (wasm hash: ${CONTRACT_INFO:0:16}...)"
+            elif echo "$CONTRACT_INFO" | grep -qi "not found\|does not exist\|invalid\|error"; then
+                # Contract doesn't exist or query failed
+                fail "$contract: Contract ID does not exist on $NETWORK"
+                fail "  Contract ID: $CONTRACT_ID"
+                fail "  Error: $(echo "$CONTRACT_INFO" | head -1)"
+                VALIDATION_FAILED=1
+            else
+                # Unexpected response
+                fail "$contract: Could not verify contract on $NETWORK"
+                info "  Exit code: $EXIT_CODE"
+                info "  Response: ${CONTRACT_INFO:0:100}"
+                VALIDATION_FAILED=1
+            fi
+        done
+        
+        # Clean up temporary network config
+        $STELLAR_CLI network rm "validation-$NETWORK" 2>/dev/null || true
+    fi
+fi
+
 # Generate manifest with validated IDs
 header "Contract Manifest"
 
