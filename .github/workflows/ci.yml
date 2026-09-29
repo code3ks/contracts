@@ -282,6 +282,9 @@ jobs:
         if: steps.abi.outcome == 'success'
         run: git diff --exit-code abi/
 
+      - name: Test validate-deployment script (mocked CLI)
+        run: bash scripts/validate-deployment.test.sh
+
   stellar-kani:
     needs: changes
     if: needs.changes.outputs.stellar == 'true'
