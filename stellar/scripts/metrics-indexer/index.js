@@ -1,13 +1,34 @@
-import { rpc } from '@stellar/stellar-sdk';
 import express from 'express';
 import { Registry, Counter, Gauge } from 'prom-client';
+
+import { createRpcClient } from './rpc-client.js';
+import { redactUrl } from './redact.js';
+import { createPoller, deriveHealthState, summarizeError } from './runtime.js';
 
 // Configuration
 const RPC_URL = process.env.RPC_URL || 'https://futurenet.sorobanrpc.com';
 const NETWORK_PASSPHRASE =
   process.env.NETWORK_PASSPHRASE || 'Test SDF Future Network ; October 2022';
 const PORT = process.env.PORT || 9090;
-const POLL_INTERVAL_MS = process.env.POLL_INTERVAL_MS || 5000;
+
+function positiveInt(raw, fallback) {
+  const parsed = Number.parseInt(raw ?? '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const POLL_INTERVAL_MS = positiveInt(process.env.POLL_INTERVAL_MS, 5000);
+// Bound the RPC work: every request gets an abortable timeout, a small retry
+// budget with jittered backoff, and a cap on how many response bytes we read.
+const RPC_TIMEOUT_MS = positiveInt(process.env.RPC_TIMEOUT_MS, 10_000);
+const RPC_MAX_ATTEMPTS = positiveInt(process.env.RPC_MAX_ATTEMPTS, 4);
+const RPC_RETRY_BASE_MS = positiveInt(process.env.RPC_RETRY_BASE_MS, 250);
+const RPC_RETRY_MAX_MS = positiveInt(process.env.RPC_RETRY_MAX_MS, 5_000);
+const RPC_MAX_RESPONSE_BYTES = positiveInt(process.env.RPC_MAX_RESPONSE_BYTES, 1_048_576);
+const HEALTH_STALE_AFTER_MS = positiveInt(
+  process.env.HEALTH_STALE_AFTER_MS,
+  POLL_INTERVAL_MS * 3
+);
+const HEALTH_FAILURE_THRESHOLD = positiveInt(process.env.HEALTH_FAILURE_THRESHOLD, 3);
 
 // Contract addresses to monitor (add your deployed contract addresses here)
 const CONTRACTS = {
@@ -71,8 +92,21 @@ const DIMENSION_SYMBOLS = {
   support: 'support',
 };
 
-// Initialize Stellar RPC server
-const server = new rpc.Server(RPC_URL);
+// Initialize the bounded RPC client. It owns the timeout, retry, and response
+// cap policy so the polling loop below stays free of transport concerns.
+const server = createRpcClient({
+  url: RPC_URL,
+  timeoutMs: RPC_TIMEOUT_MS,
+  maxAttempts: RPC_MAX_ATTEMPTS,
+  retryBaseMs: RPC_RETRY_BASE_MS,
+  retryMaxMs: RPC_RETRY_MAX_MS,
+  maxResponseBytes: RPC_MAX_RESPONSE_BYTES,
+  onRetry: ({ method, attempt, delay, error }) => {
+    console.warn(
+      `Retrying RPC ${method} (attempt ${attempt}) in ${delay}ms after ${summarizeError(error)}`
+    );
+  },
+});
 
 // Initialize Prometheus registry
 export const register = new Registry();
@@ -193,7 +227,7 @@ export function parseMetricEvent(event) {
       dimensions,
     };
   } catch (error) {
-    console.error('Error parsing metric event:', error);
+    console.error(`Error parsing metric event: ${summarizeError(error)}`);
     return null;
   }
 }
@@ -234,10 +268,17 @@ export function updateMetric(metricEvent) {
   }
 }
 
-// Fetch events from a contract
-async function fetchContractEvents(contractAddress, cursor = '0') {
-  try {
-    const response = await server.getEvents({
+// Health + poll state shared with the /health endpoint.
+const startedAt = Date.now();
+const health = { lastFailures: 0, lastError: null };
+let activePollController = null;
+
+// Fetch one page of events for a contract through the bounded RPC client.
+// The client enforces an abortable timeout, a bounded retry budget with
+// jitter, and a cap on the response body it will read.
+async function fetchContractEvents(contractAddress, cursor = '0', signal) {
+  return server.getEvents(
+    {
       filters: [
         {
           type: 'contract',
@@ -246,40 +287,82 @@ async function fetchContractEvents(contractAddress, cursor = '0') {
       ],
       cursor,
       limit: 100,
-    });
-
-    return response;
-  } catch (error) {
-    console.error(`Error fetching events for contract ${contractAddress}:`, error);
-    return null;
-  }
+    },
+    { signal }
+  );
 }
 
-// Process events from all contracts
-async function processEvents() {
-  console.log('Processing events...');
+// Poll every configured contract once.
+//
+// A failure for one address is tolerated so it cannot stall the others; the
+// poll only rejects when every configured contract failed, which is what turns
+// the health endpoint unhealthy. Errors are logged through `summarizeError`,
+// so no provider body is ever replayed in full.
+export async function processEvents({ signal } = {}) {
+  const configured = Object.entries(CONTRACTS).filter(([, address]) => Boolean(address));
+  const failures = [];
+  let succeeded = 0;
 
-  for (const [name, address] of Object.entries(CONTRACTS)) {
-    if (!address) {
-      console.log(`Skipping ${name}: no address configured`);
-      continue;
-    }
-
-    console.log(`Fetching events for ${name} (${address})...`);
-    const events = await fetchContractEvents(address);
-
-    if (events && events.events) {
-      for (const event of events.events) {
+  for (const [name, address] of configured) {
+    try {
+      const response = await fetchContractEvents(address, '0', signal);
+      for (const event of response?.events ?? []) {
         const metricEvent = parseMetricEvent(event);
         if (metricEvent) {
-          console.log(`Processing metric event:`, metricEvent);
           updateMetric(metricEvent);
         }
       }
+      succeeded += 1;
+    } catch (error) {
+      if (signal?.aborted) {
+        throw error;
+      }
+      failures.push({ contract: name, error });
+      console.error(`Error fetching events for ${name}: ${summarizeError(error)}`);
     }
   }
 
-  console.log('Event processing complete');
+  health.lastFailures = failures.length;
+  if (failures.length > 0) {
+    health.lastError = { message: summarizeError(failures[0].error), at: Date.now() };
+  }
+
+  if (configured.length > 0 && succeeded === 0) {
+    throw new Error(`all ${configured.length} configured contract poll(s) failed`);
+  }
+
+  return { succeeded, failed: failures.length };
+}
+
+// Serialized poller: a slow poll delays the next tick instead of overlapping
+// it, and `runOnce` guards against any concurrent manual invocation.
+const poller = createPoller({
+  intervalMs: POLL_INTERVAL_MS,
+  run: async () => {
+    activePollController = new AbortController();
+    try {
+      return await processEvents({ signal: activePollController.signal });
+    } finally {
+      activePollController = null;
+    }
+  },
+  onError: (error) => console.error(`Poll failed: ${summarizeError(error)}`),
+});
+
+// Public, bounded health snapshot. Secrets stay out of it (only the redacted
+// RPC host is reported) and the error summary is truncated.
+export function healthSnapshot(now = Date.now()) {
+  return deriveHealthState({
+    now,
+    startedAt,
+    stats: poller.stats,
+    lastFailures: health.lastFailures,
+    lastError: health.lastError,
+    staleAfterMs: HEALTH_STALE_AFTER_MS,
+    failureThreshold: HEALTH_FAILURE_THRESHOLD,
+    rpcHost: redactUrl(RPC_URL),
+    pollIntervalMs: POLL_INTERVAL_MS,
+  });
 }
 
 export function start() {
@@ -291,37 +374,54 @@ export function start() {
       res.set('Content-Type', register.contentType);
       res.end(await register.metrics());
     } catch (error) {
-      res.status(500).end(error.toString());
+      res.status(500).end(summarizeError(error));
     }
   });
 
+  // Degraded/unhealthy status is reported here. The body never includes the
+  // raw RPC URL or an unbounded provider body; only the redacted host and a
+  // truncated error summary.
   app.get('/health', (req, res) => {
-    res.json({ status: 'healthy' });
+    const snapshot = healthSnapshot();
+    res.status(snapshot.status === 'unhealthy' ? 503 : 200).json(snapshot);
   });
 
-  app.listen(PORT, () => {
+  const httpServer = app.listen(PORT, () => {
     console.log(`Metrics indexer listening on port ${PORT}`);
     console.log(`Prometheus metrics available at http://localhost:${PORT}/metrics`);
-    console.log(`RPC URL: ${RPC_URL}`);
+    console.log(`RPC host: ${redactUrl(RPC_URL)}`);
     console.log(`Network: ${NETWORK_PASSPHRASE}`);
+    console.log(
+      `Polling every ${POLL_INTERVAL_MS}ms ` +
+        `(timeout ${RPC_TIMEOUT_MS}ms, up to ${RPC_MAX_ATTEMPTS} attempts)`
+    );
 
-    // Initial event processing
-    processEvents();
-
-    // Poll for new events
-    setInterval(processEvents, POLL_INTERVAL_MS);
+    // Initial poll and then a serialized loop; a slow poll cannot overlap the
+    // next one.
+    poller.start();
   });
 
-  // Graceful shutdown
-  process.on('SIGTERM', () => {
-    console.log('SIGTERM received, shutting down gracefully');
-    process.exit(0);
-  });
+  let shuttingDown = false;
+  async function shutdown(signalName) {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    console.log(`${signalName} received, shutting down gracefully`);
 
-  process.on('SIGINT', () => {
-    console.log('SIGINT received, shutting down gracefully');
-    process.exit(0);
-  });
+    // Abort any in-flight RPC call, then let the loop finish.
+    activePollController?.abort();
+    await poller.stop();
+
+    httpServer.close(() => process.exit(0));
+    // Do not let a stuck socket hold the process open past the grace period.
+    setTimeout(() => process.exit(0), 5000).unref();
+  }
+
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+
+  return httpServer;
 }
 
 // Only start the HTTP server when run directly, so the parser and aggregator

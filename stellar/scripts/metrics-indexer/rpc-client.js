@@ -1,0 +1,341 @@
+// Bounded JSON-RPC transport for the metrics indexer.
+//
+// The Stellar SDK's `rpc.Server` posts through a shared Axios instance and
+// does not forward an `AbortSignal` per call, so a hung RPC node can pin a
+// poll forever. This module talks JSON-RPC directly with `fetch` instead,
+// which lets every request carry:
+//
+//   * an abortable timeout (the socket is actually released, not abandoned),
+//   * a bounded retry budget with full-jitter backoff,
+//   * a hard cap on how many response bytes we will read, and
+//   * errors whose messages are truncated, so a huge provider body can never
+//     be replayed into the logs.
+//
+// Event decoding reuses the SDK's `xdr`/`scValToNative`, so the parsed events
+// match what the aggregator already expects (native JS topics and values).
+
+import { xdr, scValToNative } from '@stellar/stellar-sdk';
+
+import { redactUrl, truncate } from './redact.js';
+
+export const DEFAULT_TIMEOUT_MS = 10_000;
+export const DEFAULT_MAX_ATTEMPTS = 4;
+export const DEFAULT_RETRY_BASE_MS = 250;
+export const DEFAULT_RETRY_MAX_MS = 5_000;
+export const DEFAULT_MAX_RESPONSE_BYTES = 1_048_576;
+
+/** Base class for transport failures, carrying retry policy metadata. */
+export class RpcError extends Error {
+  constructor(message, { method, retryable = false, status, code, bodyPreview } = {}) {
+    super(message);
+    this.name = 'RpcError';
+    this.method = method;
+    this.retryable = retryable;
+    if (status !== undefined) {
+      this.status = status;
+    }
+    if (code !== undefined) {
+      this.code = code;
+    }
+    if (bodyPreview !== undefined) {
+      this.bodyPreview = bodyPreview;
+    }
+  }
+}
+
+/** The request exceeded the configured timeout and was aborted. */
+export class RpcTimeoutError extends RpcError {
+  constructor({ method, timeoutMs }) {
+    super(`RPC ${method} timed out after ${timeoutMs}ms`, { method, retryable: true });
+    this.name = 'RpcTimeoutError';
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+/** The caller's own AbortSignal fired; retrying would be wrong. */
+export class RpcAbortError extends RpcError {
+  constructor({ method }) {
+    super(`RPC ${method} aborted`, { method, retryable: false });
+    this.name = 'RpcAbortError';
+  }
+}
+
+/** The RPC endpoint returned a non-2xx HTTP status. */
+export class RpcHttpError extends RpcError {
+  constructor({ method, status, retryable, bodyPreview }) {
+    super(`RPC ${method} failed with HTTP ${status}`, { method, retryable, status, bodyPreview });
+    this.name = 'RpcHttpError';
+  }
+}
+
+/** The provider tried to return more bytes than we are willing to read. */
+export class RpcResponseTooLargeError extends RpcError {
+  constructor({ method, maxResponseBytes }) {
+    super(`RPC ${method} response exceeded ${maxResponseBytes} bytes`, { method, retryable: false });
+    this.name = 'RpcResponseTooLargeError';
+    this.maxResponseBytes = maxResponseBytes;
+  }
+}
+
+// Read at most `maxResponseBytes` from a fetch Response, then release the
+// socket. Without this a misbehaving provider could stream unbounded data into
+// memory before we ever get to parse it.
+async function readTextCapped(response, maxResponseBytes, method) {
+  const { body } = response;
+
+  if (!body || typeof body.getReader !== 'function') {
+    const text = await response.text();
+    if (Buffer.byteLength(text, 'utf8') > maxResponseBytes) {
+      throw new RpcResponseTooLargeError({ method, maxResponseBytes });
+    }
+    return text;
+  }
+
+  const reader = body.getReader();
+  const chunks = [];
+  let size = 0;
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      size += value.byteLength;
+      if (size > maxResponseBytes) {
+        throw new RpcResponseTooLargeError({ method, maxResponseBytes });
+      }
+      chunks.push(value);
+    }
+  } finally {
+    // Cancels the stream on the cap/abort path and is a no-op once drained.
+    await reader.cancel().catch(() => {});
+  }
+
+  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString('utf8');
+}
+
+// Abortable sleep so a retry wait or the poller's idle gap can be interrupted
+// promptly on shutdown.
+function defaultSleep(ms, signal) {
+  if (!signal) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  if (signal.aborted) {
+    return Promise.reject(new RpcAbortError({ method: 'sleep' }));
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new RpcAbortError({ method: 'sleep' }));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function buildGetEventsParams(request = {}) {
+  const params = { filters: request.filters ?? [] };
+  const pagination = {};
+  if (request.cursor) {
+    pagination.cursor = request.cursor;
+  }
+  if (request.limit) {
+    pagination.limit = request.limit;
+  }
+  if (Object.keys(pagination).length > 0) {
+    params.pagination = pagination;
+  }
+  if (request.startLedger) {
+    params.startLedger = request.startLedger;
+  }
+  return params;
+}
+
+function decodeScVal(encoded) {
+  return scValToNative(xdr.ScVal.fromXDR(encoded, 'base64'));
+}
+
+// Mirror `rpc.Server.getEvents` but convert topics/values to native JS, which
+// is what `parseMetricEvent` consumes.
+function parseEvents(raw) {
+  if (!raw || typeof raw !== 'object') {
+    return { latestLedger: undefined, events: [] };
+  }
+  const events = Array.isArray(raw.events) ? raw.events : [];
+  return {
+    ...raw,
+    events: events.map((event) => ({
+      ...event,
+      topic: Array.isArray(event.topic) ? event.topic.map(decodeScVal) : [],
+      value: event.value === undefined ? undefined : decodeScVal(event.value),
+    })),
+  };
+}
+
+/**
+ * Create a bounded RPC client.
+ *
+ * @param {object} [options]
+ * @param {string} options.url JSON-RPC endpoint.
+ * @param {number} [options.timeoutMs] Per-attempt timeout; the request is aborted.
+ * @param {number} [options.maxAttempts] Total attempts, including the first.
+ * @param {number} [options.retryBaseMs] Base delay for jittered backoff.
+ * @param {number} [options.retryMaxMs] Ceiling for the jittered delay.
+ * @param {number} [options.maxResponseBytes] Hard cap on response bytes read.
+ * @param {typeof fetch} [options.fetchImpl] Injectable transport (tests).
+ * @param {(ms: number, signal?: AbortSignal) => Promise<void>} [options.sleep]
+ * @param {() => number} [options.random] Injectable RNG (tests).
+ * @param {(info: object) => void} [options.onRetry] Retry observer.
+ */
+export function createRpcClient(options = {}) {
+  const {
+    url,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    maxAttempts = DEFAULT_MAX_ATTEMPTS,
+    retryBaseMs = DEFAULT_RETRY_BASE_MS,
+    retryMaxMs = DEFAULT_RETRY_MAX_MS,
+    maxResponseBytes = DEFAULT_MAX_RESPONSE_BYTES,
+    fetchImpl = globalThis.fetch,
+    sleep = defaultSleep,
+    random = Math.random,
+    onRetry,
+  } = options;
+
+  if (typeof url !== 'string' || url.length === 0) {
+    throw new TypeError('createRpcClient requires a url');
+  }
+  if (typeof fetchImpl !== 'function') {
+    throw new TypeError('createRpcClient requires a fetch implementation');
+  }
+
+  const redactedUrl = options.redactedUrl ?? redactUrl(url);
+
+  // Full-jitter backoff: uniform over [0, base * 2^(attempt-1)) capped at
+  // retryMaxMs. Bounded above, so a retry storm cannot grow without limit.
+  function backoffDelay(attempt) {
+    const cap = Math.min(retryMaxMs, retryBaseMs * 2 ** (attempt - 1));
+    return Math.floor(random() * cap);
+  }
+
+  async function callOnce(method, params, externalSignal) {
+    const controller = new AbortController();
+    let timedOut = false;
+
+    const onExternalAbort = () => controller.abort(externalSignal.reason);
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        controller.abort(externalSignal.reason);
+      } else {
+        externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+      }
+    }
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort(new RpcTimeoutError({ method, timeoutMs }));
+    }, timeoutMs);
+
+    try {
+      const response = await fetchImpl(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method,
+          params: params === undefined ? null : params,
+        }),
+        signal: controller.signal,
+      });
+
+      const text = await readTextCapped(response, maxResponseBytes, method);
+
+      if (!response.ok) {
+        throw new RpcHttpError({
+          method,
+          status: response.status,
+          // 429/5xx are transient; everything else is a client-side mistake.
+          retryable: response.status === 429 || response.status >= 500,
+          bodyPreview: truncate(text, 256),
+        });
+      }
+
+      let payload;
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        throw new RpcHttpError({
+          method,
+          status: response.status,
+          retryable: false,
+          bodyPreview: truncate(text, 256),
+        });
+      }
+
+      if (payload && payload.error) {
+        const code = payload.error.code;
+        throw new RpcError(
+          `RPC ${method} error ${code ?? ''}: ${truncate(payload.error.message ?? 'unknown', 200)}`,
+          { method, code, retryable: code === -32603 }
+        );
+      }
+
+      return payload?.result;
+    } catch (error) {
+      if (timedOut) {
+        throw new RpcTimeoutError({ method, timeoutMs });
+      }
+      if (externalSignal?.aborted) {
+        throw new RpcAbortError({ method });
+      }
+      if (error instanceof RpcError) {
+        throw error;
+      }
+      throw new RpcError(`RPC ${method} network error: ${truncate(error?.message ?? error, 200)}`, {
+        method,
+        retryable: true,
+      });
+    } finally {
+      clearTimeout(timer);
+      if (externalSignal) {
+        externalSignal.removeEventListener('abort', onExternalAbort);
+      }
+    }
+  }
+
+  async function call(method, params, { signal } = {}) {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await callOnce(method, params, signal);
+      } catch (error) {
+        const retryable = error instanceof RpcError && error.retryable;
+        if (!retryable || attempt >= maxAttempts || signal?.aborted) {
+          throw error;
+        }
+        const delay = backoffDelay(attempt);
+        if (onRetry) {
+          onRetry({ method, attempt, delay, error });
+        }
+        await sleep(delay, signal);
+      }
+    }
+  }
+
+  return {
+    redactedUrl,
+    config: { timeoutMs, maxAttempts, retryBaseMs, retryMaxMs, maxResponseBytes },
+    call,
+    getLatestLedger: ({ signal } = {}) => call('getLatestLedger', undefined, { signal }),
+    getEvents: async (request, { signal } = {}) => {
+      const raw = await call('getEvents', buildGetEventsParams(request), { signal });
+      return parseEvents(raw);
+    },
+  };
+}
