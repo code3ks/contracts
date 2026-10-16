@@ -6,3 +6,10 @@
 # GHSA-xxxx-xxxx-xxxx  # dev-only, not reachable from CI; @reviewer; revisit 2026-12-01
 RUSTSEC-2026-0253  # lru 0.7.8, transitive test-only dep via ckb-verification 1.2.1 (ckb-testtool); ckb-verification caps lru at ^0.7.1 and has no newer release, so 0.18.2 (the fix) is unreachable from this graph; not part of the shipped contract artifact; @truthixify; revisit 2027-03-01
 RUSTSEC-2026-0186  # memmap2 0.5.10, transitive test-only dep pulled in via cacache 13.1.0's optional mmap feature (required by ckb-chain-spec); cacache caps memmap2 at ^0.5.8 and has no newer release, so 0.9.11 (the fix) is unreachable from this graph; not part of the shipped contract artifact; @truthixify; revisit 2027-03-01
+#
+# toml@3.0.0 is pinned exactly by @stellar/stellar-sdk and already ships in the
+# root and stellar/ lockfiles; the metrics-indexer lockfile only makes it visible
+# to this diff. The indexer never calls toml.parse() (no contract-spec/WASM
+# parsing), so the parser advisories are not reachable from it.
+GHSA-82x6-q7mm-w9cf  # toml@3.0.0 via @stellar/stellar-sdk, not reachable from metrics-indexer; @truthixify; revisit 2027-01-16
+GHSA-v5mp-jgw5-2x6j  # toml@3.0.0 via @stellar/stellar-sdk, not reachable from metrics-indexer; @truthixify; revisit 2027-01-16
