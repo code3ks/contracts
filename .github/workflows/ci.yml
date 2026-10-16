@@ -147,6 +147,17 @@ jobs:
         run: pnpm test:stellar-bindings
         working-directory: .
 
+      # The metrics indexer is a standalone Node package with its own lockfile
+      # (like evm/ and solana/). Install and test it so its RPC/health
+      # guarantees stay enforced; the root pnpm install does not cover it.
+      - name: Install metrics indexer dependencies
+        working-directory: stellar/scripts/metrics-indexer
+        run: npm ci
+
+      - name: Test metrics indexer
+        working-directory: stellar/scripts/metrics-indexer
+        run: npm test
+
       - name: Setup Stellar CLI
         run: |
           curl -sSfL -o stellar-cli.tar.gz \

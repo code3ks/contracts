@@ -24,6 +24,14 @@ globalThis.fetch = async (url, init) => {
     return new Response('provider exploded', { status: 500 });
   }
 
+  if (mode === 'malformed') {
+    // The maintainer's reproducer: a 200 envelope with no `result`/`error`.
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1 }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
   return new Response(
     JSON.stringify({ jsonrpc: '2.0', id: 1, result: { latestLedger: 1, events: [] } }),
     { status: 200, headers: { 'Content-Type': 'application/json' } }
@@ -61,6 +69,23 @@ describe('metrics indexer poll wiring', () => {
   it('rejects when every configured contract fails', async () => {
     mode = 'all-fail';
     await assert.rejects(index.processEvents(), /all 2 configured contract poll\(s\) failed/);
+  });
+
+  it('treats a malformed JSON-RPC response as a poll failure', async () => {
+    mode = 'malformed';
+    await assert.rejects(index.processEvents(), /all 2 configured contract poll\(s\) failed/);
+    assert.equal(index.healthSnapshot().status, 'degraded');
+  });
+
+  it('fails closed when no contracts are configured', async () => {
+    await assert.rejects(index.processEvents({ contracts: {} }), (error) => {
+      assert.ok(error instanceof index.IndexerConfigurationError);
+      return true;
+    });
+
+    const health = index.healthSnapshot();
+    assert.notEqual(health.status, 'healthy');
+    assert.ok(health.lastError);
   });
 
   it('never exposes the raw RPC URL or its secrets in health output', async () => {

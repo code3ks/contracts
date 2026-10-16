@@ -52,7 +52,9 @@ export GOVERNANCE_ADDRESS="CC..."
 ```
 
 Any address left unset is skipped, so the indexer can be pointed at a subset of
-the deployment.
+the deployment. Leaving **every** address unset is a configuration error: the
+poll fails and `/health` reports `degraded`/`unhealthy` instead of a healthy
+no-op.
 
 ## Usage
 
@@ -124,6 +126,11 @@ truncated error summary — never the full URL, credentials, or a provider body.
 - **Bounded provider bodies.** Responses are read up to
   `RPC_MAX_RESPONSE_BYTES` and then cut off; error messages and log lines are
   truncated.
+- **Fail closed on malformed responses.** A 2xx body that is not a valid
+  JSON-RPC 2.0 envelope (missing/wrong `id`, no `result` or `error`, both) or a
+  `getEvents` result without a numeric `latestLedger` and an `events` array is
+  rejected as a poll failure. A malformed response never becomes a successful
+  empty page, so metrics cannot silently stop while `/health` stays healthy.
 
 ## Metrics Exported
 
@@ -232,7 +239,8 @@ symbol table.
 
 ```bash
 npm test        # node --test; covers timeout/abort, retry+jitter, response cap,
-                # overlap prevention, health states, and redaction
+                # malformed-response rejection, empty-config failure, overlap
+                # prevention, health states, and redaction
 ```
 
 ### Verify the dashboard against a synthetic event stream

@@ -268,6 +268,18 @@ export function updateMetric(metricEvent) {
   }
 }
 
+/**
+ * Raised when the indexer has no contract to poll. This is a configuration
+ * fault, not a transient RPC failure: it must surface as a poll failure
+ * (degraded/unhealthy) rather than a silent no-op success.
+ */
+export class IndexerConfigurationError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'IndexerConfigurationError';
+  }
+}
+
 // Health + poll state shared with the /health endpoint.
 const startedAt = Date.now();
 const health = { lastFailures: 0, lastError: null };
@@ -298,8 +310,24 @@ async function fetchContractEvents(contractAddress, cursor = '0', signal) {
 // poll only rejects when every configured contract failed, which is what turns
 // the health endpoint unhealthy. Errors are logged through `summarizeError`,
 // so no provider body is ever replayed in full.
-export async function processEvents({ signal } = {}) {
-  const configured = Object.entries(CONTRACTS).filter(([, address]) => Boolean(address));
+//
+// An empty contract configuration is a configuration fault, not a no-op: with
+// nothing to poll the indexer can never observe any event, so it must fail the
+// poll (and therefore /health) instead of reporting a successful empty run.
+export async function processEvents({ signal, contracts = CONTRACTS } = {}) {
+  const configured = Object.entries(contracts).filter(([, address]) => Boolean(address));
+
+  if (configured.length === 0) {
+    health.lastFailures = 0;
+    health.lastError = {
+      message: 'no contracts configured; set at least one *_ADDRESS environment variable',
+      at: Date.now(),
+    };
+    throw new IndexerConfigurationError(
+      'no contracts configured: set at least one *_ADDRESS environment variable'
+    );
+  }
+
   const failures = [];
   let succeeded = 0;
 

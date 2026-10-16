@@ -6,6 +6,7 @@ import { nativeToScVal, xdr, scValToNative } from '@stellar/stellar-sdk';
 import {
   RpcAbortError,
   RpcHttpError,
+  RpcProtocolError,
   RpcResponseTooLargeError,
   RpcTimeoutError,
   createRpcClient,
@@ -217,6 +218,103 @@ describe('createRpcClient', () => {
     await assert.rejects(client.getLatestLedger(), (error) => {
       assert.ok(error instanceof RpcHttpError);
       assert.ok(error.bodyPreview.length < 400);
+      return true;
+    });
+  });
+
+  it('rejects a 200 response that carries neither result nor error', async () => {
+    // Regression: `{"jsonrpc":"2.0","id":1}` used to resolve to `undefined`,
+    // which became a successful empty page and let /health stay healthy while
+    // no events were ever indexed.
+    let attempts = 0;
+    const client = createRpcClient({
+      url: 'https://rpc.example.com',
+      fetchImpl: async () => {
+        attempts += 1;
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1 }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      },
+      sleep: async () => {},
+    });
+
+    await assert.rejects(client.getEvents({ filters: [] }), (error) => {
+      assert.ok(error instanceof RpcProtocolError);
+      assert.equal(error.retryable, false);
+      return true;
+    });
+    assert.equal(attempts, 1);
+  });
+
+  it('rejects a response whose id does not match the request', async () => {
+    const client = createRpcClient({
+      url: 'https://rpc.example.com',
+      fetchImpl: async () =>
+        new Response(JSON.stringify({ jsonrpc: '2.0', id: 99, result: { events: [] } }), {
+          status: 200,
+        }),
+      sleep: async () => {},
+    });
+
+    await assert.rejects(client.getLatestLedger(), (error) => {
+      assert.ok(error instanceof RpcProtocolError);
+      return true;
+    });
+  });
+
+  it('rejects a non-JSON 200 body instead of treating it as empty', async () => {
+    const client = createRpcClient({
+      url: 'https://rpc.example.com',
+      fetchImpl: async () => new Response('<html>origin error</html>', { status: 200 }),
+      sleep: async () => {},
+    });
+
+    await assert.rejects(client.getEvents({ filters: [] }), (error) => {
+      assert.ok(error instanceof RpcProtocolError);
+      return true;
+    });
+  });
+
+  it('rejects a getEvents result without an events array', async () => {
+    const client = createRpcClient({
+      url: 'https://rpc.example.com',
+      fetchImpl: async () => jsonResponse({ latestLedger: 7 }),
+      sleep: async () => {},
+    });
+
+    await assert.rejects(client.getEvents({ filters: [] }), (error) => {
+      assert.ok(error instanceof RpcProtocolError);
+      return true;
+    });
+  });
+
+  it('rejects a getEvents result without a latestLedger', async () => {
+    const client = createRpcClient({
+      url: 'https://rpc.example.com',
+      fetchImpl: async () => jsonResponse({ events: [] }),
+      sleep: async () => {},
+    });
+
+    await assert.rejects(client.getEvents({ filters: [] }), (error) => {
+      assert.ok(error instanceof RpcProtocolError);
+      return true;
+    });
+  });
+
+  it('rejects an event whose ScVal cannot be decoded', async () => {
+    const client = createRpcClient({
+      url: 'https://rpc.example.com',
+      fetchImpl: async () =>
+        jsonResponse({
+          latestLedger: 7,
+          events: [{ topic: ['not-base64!!'], value: symbol('metric') }],
+        }),
+      sleep: async () => {},
+    });
+
+    await assert.rejects(client.getEvents({ filters: [] }), (error) => {
+      assert.ok(error instanceof RpcProtocolError);
       return true;
     });
   });

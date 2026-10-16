@@ -24,6 +24,10 @@ export const DEFAULT_RETRY_BASE_MS = 250;
 export const DEFAULT_RETRY_MAX_MS = 5_000;
 export const DEFAULT_MAX_RESPONSE_BYTES = 1_048_576;
 
+// JSON-RPC request id. We issue one request at a time, so a constant is enough
+// and it lets us verify the provider echoed the id back.
+const REQUEST_ID = 1;
+
 /** Base class for transport failures, carrying retry policy metadata. */
 export class RpcError extends Error {
   constructor(message, { method, retryable = false, status, code, bodyPreview } = {}) {
@@ -74,6 +78,23 @@ export class RpcResponseTooLargeError extends RpcError {
     super(`RPC ${method} response exceeded ${maxResponseBytes} bytes`, { method, retryable: false });
     this.name = 'RpcResponseTooLargeError';
     this.maxResponseBytes = maxResponseBytes;
+  }
+}
+
+/**
+ * The provider returned a 2xx body that is not a well-formed JSON-RPC response
+ * for the request we sent. Treated as fatal: a malformed envelope or result
+ * must never be mistaken for an empty (successful) result.
+ */
+export class RpcProtocolError extends RpcError {
+  constructor({ method, reason, bodyPreview }) {
+    super(`RPC ${method} returned a malformed JSON-RPC response: ${reason}`, {
+      method,
+      retryable: false,
+      bodyPreview,
+    });
+    this.name = 'RpcProtocolError';
+    this.reason = reason;
   }
 }
 
@@ -155,24 +176,79 @@ function buildGetEventsParams(request = {}) {
   return params;
 }
 
-function decodeScVal(encoded) {
-  return scValToNative(xdr.ScVal.fromXDR(encoded, 'base64'));
+function decodeScVal(encoded, method = 'getEvents') {
+  if (typeof encoded !== 'string') {
+    throw new RpcProtocolError({ method, reason: 'event ScVal was not a base64 string' });
+  }
+  try {
+    return scValToNative(xdr.ScVal.fromXDR(encoded, 'base64'));
+  } catch (error) {
+    throw new RpcProtocolError({
+      method,
+      reason: `event ScVal could not be decoded: ${truncate(error?.message ?? error, 120)}`,
+    });
+  }
+}
+
+// A well-formed JSON-RPC 2.0 response echoes our id and carries exactly one of
+// `result`/`error`. A 200 body that omits both (for example
+// `{"jsonrpc":"2.0","id":1}`) is a provider bug: without this check it would be
+// parsed as a successful, empty result and the poll would report success while
+// silently indexing nothing.
+function validateEnvelope(payload, method) {
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new RpcProtocolError({ method, reason: 'response body was not a JSON object' });
+  }
+  if (payload.jsonrpc !== '2.0') {
+    throw new RpcProtocolError({ method, reason: 'response omitted jsonrpc "2.0"' });
+  }
+  if (!('id' in payload) || String(payload.id) !== String(REQUEST_ID)) {
+    throw new RpcProtocolError({ method, reason: 'response id did not match the request id' });
+  }
+  const hasResult = Object.prototype.hasOwnProperty.call(payload, 'result');
+  const hasError = Object.prototype.hasOwnProperty.call(payload, 'error');
+  if (hasResult && hasError) {
+    throw new RpcProtocolError({ method, reason: 'response contained both result and error' });
+  }
+  if (!hasResult && !hasError) {
+    throw new RpcProtocolError({ method, reason: 'response contained neither result nor error' });
+  }
 }
 
 // Mirror `rpc.Server.getEvents` but convert topics/values to native JS, which
-// is what `parseMetricEvent` consumes.
+// is what `parseMetricEvent` consumes. The `getEvents` result shape is
+// validated, not defaulted: a missing or invalid `events` array must fail the
+// poll instead of being reported as an empty (successful) page.
 function parseEvents(raw) {
-  if (!raw || typeof raw !== 'object') {
-    return { latestLedger: undefined, events: [] };
+  const method = 'getEvents';
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new RpcProtocolError({ method, reason: 'getEvents result was not an object' });
   }
-  const events = Array.isArray(raw.events) ? raw.events : [];
+  if (!Number.isFinite(raw.latestLedger)) {
+    throw new RpcProtocolError({
+      method,
+      reason: 'getEvents result omitted a numeric latestLedger',
+    });
+  }
+  if (!Array.isArray(raw.events)) {
+    throw new RpcProtocolError({ method, reason: 'getEvents result.events was not an array' });
+  }
+
   return {
     ...raw,
-    events: events.map((event) => ({
-      ...event,
-      topic: Array.isArray(event.topic) ? event.topic.map(decodeScVal) : [],
-      value: event.value === undefined ? undefined : decodeScVal(event.value),
-    })),
+    events: raw.events.map((event) => {
+      if (event === null || typeof event !== 'object' || Array.isArray(event)) {
+        throw new RpcProtocolError({ method, reason: 'getEvents event entry was not an object' });
+      }
+      if (!Array.isArray(event.topic)) {
+        throw new RpcProtocolError({ method, reason: 'getEvents event topic was not an array' });
+      }
+      return {
+        ...event,
+        topic: event.topic.map((encoded) => decodeScVal(encoded, method)),
+        value: event.value === undefined ? undefined : decodeScVal(event.value, method),
+      };
+    }),
   };
 }
 
@@ -248,7 +324,7 @@ export function createRpcClient(options = {}) {
         },
         body: JSON.stringify({
           jsonrpc: '2.0',
-          id: 1,
+          id: REQUEST_ID,
           method,
           params: params === undefined ? null : params,
         }),
@@ -271,23 +347,26 @@ export function createRpcClient(options = {}) {
       try {
         payload = JSON.parse(text);
       } catch {
-        throw new RpcHttpError({
+        throw new RpcProtocolError({
           method,
-          status: response.status,
-          retryable: false,
+          reason: 'response body was not valid JSON',
           bodyPreview: truncate(text, 256),
         });
       }
 
-      if (payload && payload.error) {
-        const code = payload.error.code;
+      validateEnvelope(payload, method);
+
+      if (payload.error !== undefined) {
+        const detail =
+          payload.error !== null && typeof payload.error === 'object' ? payload.error : {};
+        const code = detail.code;
         throw new RpcError(
-          `RPC ${method} error ${code ?? ''}: ${truncate(payload.error.message ?? 'unknown', 200)}`,
+          `RPC ${method} error ${code ?? ''}: ${truncate(detail.message ?? 'unknown', 200)}`,
           { method, code, retryable: code === -32603 }
         );
       }
 
-      return payload?.result;
+      return payload.result;
     } catch (error) {
       if (timedOut) {
         throw new RpcTimeoutError({ method, timeoutMs });
