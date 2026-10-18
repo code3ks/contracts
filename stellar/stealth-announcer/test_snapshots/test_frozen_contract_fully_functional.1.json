@@ -1,9 +1,13 @@
 {
   "generators": {
-    "address": 12,
+    "address": 16,
     "nonce": 0
   },
   "auth": [
+    [],
+    [],
+    [],
+    [],
     [],
     [],
     [],
@@ -98,7 +102,7 @@
                 "u32": 2
               },
               {
-                "u32": 9
+                "u32": 13
               },
               {
                 "u32": 1
@@ -107,13 +111,13 @@
             "data": {
               "vec": [
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYRE5"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABB6KO"
                 },
                 {
-                  "bytes": "0902020202020202020202020202020202020202020202020202020202020202"
+                  "bytes": "e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2"
                 },
                 {
-                  "bytes": "0902"
+                  "bytes": "0d02"
                 }
               ]
             }

@@ -16,11 +16,11 @@ use stealth_splitter::{Beneficiary, StealthSplitterContract, StealthSplitterCont
 use stealth_vault::{StealthVaultContract, StealthVaultContractClient};
 use wraith_names::{WraithNamesContract, WraithNamesContractClient};
 
-/// Fill bytes whose `[fill; 32]` encoding is a valid ed25519 public key, so the
-/// announcer's encoding checks accept the generated harness inputs.
-const VALID_EPK_FILLS: [u8; 32] = [
-    0x01, 0x03, 0x06, 0x09, 0x0a, 0x0b, 0x0c, 0x10, 0x11, 0x13, 0x16, 0x17, 0x19, 0x1a, 0x1d, 0x20,
-    0x22, 0x23, 0x24, 0x25, 0x28, 0x2a, 0x2c, 0x2e, 0x2f, 0x32, 0x33, 0x35, 0x36, 0x3a, 0x47, 0x49,
+/// Fill bytes whose `[fill; 32]` encoding is a canonical, on-curve, torsion-free
+/// ed25519 public key, so the announcer's validation accepts the generated
+/// harness inputs.
+const VALID_EPK_FILLS: [u8; 14] = [
+    0x06, 0x19, 0x1a, 0x1d, 0x35, 0x4c, 0x7b, 0x81, 0x83, 0x8f, 0x97, 0xa7, 0xd6, 0xe2,
 ];
 
 fn valid_epk_fill(seed: usize) -> u8 {
@@ -63,7 +63,7 @@ pub fn collect_rows() -> std::vec::Vec<Row> {
                 client.announce(
                     &STELLAR_V2_SCHEME_ID,
                     &Address::generate(env),
-                    &BytesN::from_array(env, &[0x09u8; 32]),
+                    &BytesN::from_array(env, &[0x06u8; 32]),
                     &bytes(env, metadata_len, 9),
                 );
             },
@@ -115,7 +115,7 @@ pub fn collect_rows() -> std::vec::Vec<Row> {
                     &100,
                     &STELLAR_V2_SCHEME_ID,
                     &Address::generate(env),
-                    &BytesN::from_array(env, &[3u8; 32]),
+                    &BytesN::from_array(env, &[0x19u8; 32]),
                     &bytes(env, 32, 4),
                 );
             },
@@ -346,7 +346,7 @@ pub fn collect_rows() -> std::vec::Vec<Row> {
                     &token,
                     &VAULT_UNLOCK_LEDGER,
                     &VAULT_REFUND_AFTER,
-                    &BytesN::from_array(env, &[11u8; 32]),
+                    &BytesN::from_array(env, &[0x1au8; 32]),
                 );
             },
         ));
@@ -366,7 +366,7 @@ pub fn collect_rows() -> std::vec::Vec<Row> {
                 &token,
                 &VAULT_UNLOCK_LEDGER,
                 &VAULT_REFUND_AFTER,
-                &BytesN::from_array(env, &[12u8; 32]),
+                &BytesN::from_array(env, &[0x1du8; 32]),
             );
             env.ledger()
                 .with_mut(|li| li.sequence_number = VAULT_UNLOCK_LEDGER);
@@ -388,7 +388,7 @@ pub fn collect_rows() -> std::vec::Vec<Row> {
                 &token,
                 &VAULT_UNLOCK_LEDGER,
                 &VAULT_REFUND_AFTER,
-                &BytesN::from_array(env, &[0x11u8; 32]),
+                &BytesN::from_array(env, &[0x35u8; 32]),
             );
             env.ledger()
                 .with_mut(|li| li.sequence_number = VAULT_REFUND_AFTER);
@@ -410,7 +410,7 @@ pub fn collect_rows() -> std::vec::Vec<Row> {
                 &token,
                 &VAULT_UNLOCK_LEDGER,
                 &VAULT_REFUND_AFTER,
-                &BytesN::from_array(env, &[0x13u8; 32]),
+                &BytesN::from_array(env, &[0x4cu8; 32]),
             );
             env.ledger().with_mut(|li| {
                 li.sequence_number = VAULT_REFUND_AFTER + stealth_vault::DEFAULT_GRACE_PERIOD

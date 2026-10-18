@@ -39,7 +39,7 @@ fn wa_ann_01_v2_payload_uses_stealth_address_not_caller() {
 
     let invoker = Address::generate(&env);
     let stealth_address = Address::generate(&env);
-    let ephemeral_pub_key = BytesN::from_array(&env, &[1u8; 32]);
+    let ephemeral_pub_key = BytesN::from_array(&env, &[0x06u8; 32]);
     let metadata = Bytes::from_slice(&env, &[0u8; 1]);
 
     client.announce(
@@ -64,7 +64,7 @@ fn wa_ann_02_oversized_metadata_is_accepted() {
     let client = StealthAnnouncerContractClient::new(&env, &contract_id);
 
     let stealth_address = Address::generate(&env);
-    let ephemeral_pub_key = BytesN::from_array(&env, &[3u8; 32]);
+    let ephemeral_pub_key = BytesN::from_array(&env, &[0x19u8; 32]);
     let metadata = Bytes::from_array(&env, &[7u8; 4096]);
 
     client.announce(
@@ -150,6 +150,24 @@ fn wa_ann_03_small_order_ephemeral_pub_key_is_rejected() {
         &STELLAR_V2_SCHEME_ID,
         &Address::generate(&env),
         &BytesN::from_array(&env, &identity),
+        &Bytes::from_slice(&env, &[0u8; 1]),
+    );
+}
+
+/// A mixed-order point is on the curve and not small-order, but it is not in
+/// the prime-order subgroup, so it cannot be an ed25519 public key. This is the
+/// exact input from the review: the repeated `0x01` encoding.
+#[test]
+#[should_panic(expected = "invalid ed25519 ephemeral public key")]
+fn wa_ann_03_mixed_order_ephemeral_pub_key_is_rejected() {
+    let env = audit_env();
+    let contract_id = env.register(StealthAnnouncerContract, ());
+    let client = StealthAnnouncerContractClient::new(&env, &contract_id);
+
+    client.announce(
+        &STELLAR_V2_SCHEME_ID,
+        &Address::generate(&env),
+        &BytesN::from_array(&env, &[0x01; 32]),
         &Bytes::from_slice(&env, &[0u8; 1]),
     );
 }

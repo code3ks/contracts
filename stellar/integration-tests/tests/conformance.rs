@@ -15,7 +15,7 @@ fn test_conformance_announcer() {
     let client = StealthAnnouncerContractClient::new(&env, &contract_id);
 
     let stealth_address = Address::generate(&env);
-    let ephemeral_pub_key = BytesN::from_array(&env, &[3; 32]);
+    let ephemeral_pub_key = BytesN::from_array(&env, &[0x06; 32]);
     let mut meta_arr = [0u8; 32];
     meta_arr[0] = 0x00; // view tag
     let metadata = Bytes::from_array(&env, &meta_arr);
@@ -70,6 +70,14 @@ fn test_conformance_announcer_rejects_non_canonical_ephemeral_pub_key() {
 #[should_panic(expected = "invalid ed25519 ephemeral public key")]
 fn test_conformance_announcer_rejects_off_curve_ephemeral_pub_key() {
     announce_with_raw_key(&[0x02u8; 32]);
+}
+
+/// A mixed-order point (`[0x01; 32]`) is on the curve and not small-order but
+/// not in the prime-order subgroup, so it must be rejected as well.
+#[test]
+#[should_panic(expected = "invalid ed25519 ephemeral public key")]
+fn test_conformance_announcer_rejects_mixed_order_ephemeral_pub_key() {
+    announce_with_raw_key(&[0x01u8; 32]);
 }
 
 fn announce_with_raw_key(raw: &[u8; 32]) {

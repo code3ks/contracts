@@ -29,12 +29,12 @@ fn bytes32(env: &Env, data: &[u8]) -> BytesN<32> {
     BytesN::from_array(env, &fixed)
 }
 
-/// Fill bytes whose `[fill; 32]` encoding is a canonical, on-curve,
-/// non-small-order ed25519 public key. The announcer rejects malformed
-/// encodings, so the payload properties draw from this pool instead of
-/// arbitrary bytes.
-const VALID_EPK_FILLS: [u8; 16] = [
-    0x01, 0x03, 0x06, 0x09, 0x0a, 0x0b, 0x0c, 0x10, 0x11, 0x13, 0x16, 0x17, 0x19, 0x1a, 0x1d, 0x20,
+/// Fill bytes whose `[fill; 32]` encoding is a canonical, on-curve, torsion-free
+/// ed25519 public key (in the prime-order subgroup, not small-order). The
+/// announcer rejects malformed encodings, so the payload properties draw from
+/// this pool instead of arbitrary bytes.
+const VALID_EPK_FILLS: [u8; 14] = [
+    0x06, 0x19, 0x1a, 0x1d, 0x35, 0x4c, 0x7b, 0x81, 0x83, 0x8f, 0x97, 0xa7, 0xd6, 0xe2,
 ];
 
 fn valid_epk() -> impl Strategy<Value = [u8; 32]> {
@@ -130,7 +130,7 @@ fn zero_length_metadata_is_rejected() {
     client.announce(
         &STELLAR_V2_SCHEME_ID,
         &stealth_address,
-        &bytes32(&env, &[1u8; 32]),
+        &bytes32(&env, &[0x06u8; 32]),
         &Bytes::new(&env),
     );
 }
@@ -147,7 +147,7 @@ fn non_v2_scheme_id_is_rejected() {
     client.announce(
         &1u32,
         &stealth_address,
-        &bytes32(&env, &[1u8; 32]),
+        &bytes32(&env, &[0x06u8; 32]),
         &metadata,
     );
 }
@@ -202,6 +202,23 @@ fn off_curve_ephemeral_pub_key_is_rejected() {
         &STELLAR_V2_SCHEME_ID,
         &Address::generate(&env),
         &bytes32(&env, &[0x02u8; 32]),
+        &bytes(&env, &[0u8]),
+    );
+}
+
+/// `0x01 * 32` is on the curve and not small-order, but it is mixed-order (not
+/// in the prime-order subgroup), so it must be rejected like libsodium does.
+#[test]
+#[should_panic(expected = "invalid ed25519 ephemeral public key")]
+fn mixed_order_ephemeral_pub_key_is_rejected() {
+    let env = env();
+    let contract_id = env.register(StealthAnnouncerContract, ());
+    let client = StealthAnnouncerContractClient::new(&env, &contract_id);
+
+    client.announce(
+        &STELLAR_V2_SCHEME_ID,
+        &Address::generate(&env),
+        &bytes32(&env, &[0x01u8; 32]),
         &bytes(&env, &[0u8]),
     );
 }

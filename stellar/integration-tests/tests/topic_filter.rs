@@ -108,14 +108,14 @@ fn topic_3_view_tag_filter_across_announcer_splitter_and_batch_sender() {
     announcer.announce(
         &STELLAR_V2_SCHEME_ID,
         &direct_match,
-        &bytes32(&env, 0x11),
+        &bytes32(&env, 0x06),
         &meta(&env, MATCH_TAG),
     );
     harvest_announces(&env, &mut harvested);
     announcer.announce(
         &STELLAR_V2_SCHEME_ID,
         &direct_other,
-        &bytes32(&env, 0x13),
+        &bytes32(&env, 0x19),
         &meta(&env, OTHER_TAGS[0]),
     );
     harvest_announces(&env, &mut harvested);
@@ -149,7 +149,7 @@ fn topic_3_view_tag_filter_across_announcer_splitter_and_batch_sender() {
         &2_000,
         &STELLAR_V2_SCHEME_ID,
         &soroban_sdk::vec![&env, split_match.clone(), split_other.clone()],
-        &soroban_sdk::vec![&env, bytes32(&env, 0x23), bytes32(&env, 0x22)],
+        &soroban_sdk::vec![&env, bytes32(&env, 0x1a), bytes32(&env, 0x1d)],
         &soroban_sdk::vec![&env, meta(&env, MATCH_TAG), meta(&env, OTHER_TAGS[1])],
     );
     harvest_announces(&env, &mut harvested);
@@ -166,13 +166,13 @@ fn topic_3_view_tag_filter_across_announcer_splitter_and_batch_sender() {
         &env,
         Transfer {
             stealth_address: batch_match.clone(),
-            ephemeral_pub_key: bytes(&env, &[0x33u8; 32]),
+            ephemeral_pub_key: bytes(&env, &[0x06u8; 32]),
             amount: 100,
             metadata: meta(&env, MATCH_TAG),
         },
         Transfer {
             stealth_address: batch_other.clone(),
-            ephemeral_pub_key: bytes(&env, &[0x32u8; 32]),
+            ephemeral_pub_key: bytes(&env, &[0x19u8; 32]),
             amount: 200,
             metadata: meta(&env, OTHER_TAGS[2]),
         },

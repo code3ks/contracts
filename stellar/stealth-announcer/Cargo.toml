@@ -11,6 +11,10 @@ testutils = ["soroban-sdk/testutils"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
+# Vetted curve arithmetic for ed25519 point validation. `default-features =
+# false` keeps it `no_std`/allocation-free, as required for the wasm contract;
+# only decompression and subgroup membership checks are used.
+curve25519-dalek = { version = "4", default-features = false }
 
 [dev-dependencies]
 proptest = "1.6.0"
